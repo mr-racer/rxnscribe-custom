@@ -14,6 +14,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
 from .attention_layer import Attention
+from .static_decoder import StaticPix2SeqDecoder
 
 
 class Transformer(nn.Module):
@@ -45,6 +46,10 @@ class Transformer(nn.Module):
         self.nhead = nhead
         self.num_decoder_layers = num_decoder_layers
         self.tokenizer = tokenizer
+        # inference options, set by the RxnScribe interface
+        self.fast_decoding = False
+        self.use_cuda_graph = False
+        self._static_decoders = {}
 
     def _reset_parameters(self):
         for p in self.parameters():
@@ -87,6 +92,11 @@ class Transformer(nn.Module):
             # hs: N x B x D
             pred_seq_logits = self.vocal_classifier(hs.transpose(0, 1))
             return pred_seq_logits
+        elif self.fast_decoding and StaticPix2SeqDecoder.supported(self):
+            key = (max_len, self.use_cuda_graph)
+            if key not in self._static_decoders:
+                self._static_decoders[key] = StaticPix2SeqDecoder(self, max_len, use_cuda_graph=self.use_cuda_graph)
+            return self._static_decoders[key](memory, pos_embed)
         else:
             end = torch.zeros(bs).bool().to(memory.device)
             end_lens = torch.zeros(bs).long().to(memory.device)

@@ -84,11 +84,14 @@ class Backbone(BackboneBase):
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
-                 dilation: bool):
+                 dilation: bool,
+                 pretrained: bool = True):
+        # ImageNet initialisation is only needed for training; at inference the checkpoint holds all backbone
+        # weights, so nothing is downloaded (`pretrained=` was removed from recent torchvision, use `weights=`)
+        weights = "IMAGENET1K_V1" if (pretrained and is_main_process()) else None
         backbone = getattr(torchvision.models, name)(
             replace_stride_with_dilation=[False, False, dilation],
-            pretrained=is_main_process(), norm_layer=FrozenBatchNorm2d)
-        # weights="IMAGENET1K_V1"
+            weights=weights, norm_layer=FrozenBatchNorm2d)
         num_channels = 512 if name in ('resnet18', 'resnet34') else 2048
         super().__init__(backbone, train_backbone, num_channels, return_interm_layers)
 
@@ -113,7 +116,8 @@ def build_backbone(args):
     position_embedding = build_position_encoding(args)
     train_backbone = True
     return_interm_layers = False
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
+    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation,
+                        pretrained=getattr(args, 'pretrained_backbone', True))
     model = Joiner(backbone, position_embedding)
     model.num_channels = backbone.num_channels
     return model

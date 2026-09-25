@@ -1,8 +1,6 @@
 import os
 import cv2
 import numpy as np
-import matplotlib.colors as colors
-import matplotlib.patches as patches
 
 
 class BBox(object):
@@ -40,15 +38,20 @@ class BBox(object):
     def unnormalize(self):
         return self.x1 * self.width, self.y1 * self.height, self.x2 * self.width, self.y2 * self.height
 
-    def image(self):
+    def pixel_box(self):
         x1, y1, x2, y2 = self.unnormalize()
-        x1, y1, x2, y2 = max(int(x1), 0), max(int(y1), 0), min(int(x2), self.width), min(int(y2), self.height)
+        return max(int(x1), 0), max(int(y1), 0), min(int(x2), self.width), min(int(y2), self.height)
+
+    def image(self):
+        x1, y1, x2, y2 = self.pixel_box()
         return self.image_data.image[y1:y2, x1:x2]
 
     COLOR = {1: 'r', 2: 'g', 3: 'b', 4: 'y'}
     CATEGORY = {1: 'Mol', 2: 'Txt', 3: 'Idt', 4: 'Sup'}
 
     def draw(self, ax, color=None):
+        import matplotlib.colors as colors  # drawing only; keeps matplotlib out of inference imports
+        import matplotlib.patches as patches
         x1, y1, x2, y2 = self.unnormalize()
         if color is None:
             color = self.COLOR[self.category_id]
@@ -337,25 +340,68 @@ def deduplicate_reactions(reactions):
 
 def postprocess_reactions(reactions, image_file=None, image=None, molscribe=None, ocr=None, batch_size=32):
     image_data = ReactionImageData(predictions=reactions, image_file=image_file, image=image)
-    pred_reactions = image_data.pred_reactions
-    for r in pred_reactions:
-        r.deduplicate()
-    pred_reactions.deduplicate()
-    if molscribe:
-        bbox_images, bbox_indices = [], []
-        for i, reaction in enumerate(pred_reactions):
-            for j, bbox in enumerate(reaction.bboxes):
-                if bbox.is_mol:
-                    bbox_images.append(bbox.image())
-                    bbox_indices.append((i, j))
-        if len(bbox_images) > 0:
-            predictions = molscribe.predict_images(bbox_images, batch_size=batch_size)
-            for (i, j), pred in zip(bbox_indices, predictions):
-                pred_reactions[i].bboxes[j].set_smiles(pred['smiles'], pred['molfile'])
-    if ocr:
+    return postprocess_reactions_batch([image_data], molscribe=molscribe, ocr=ocr, batch_size=batch_size)[0]
+
+
+def _unique_crops(all_reactions, want_mol):
+    """Crops to recognise, one per distinct pixel box: a molecule shared by two reactions is read once."""
+    crops, groups, index = [], [], {}
+    for k, pred_reactions in enumerate(all_reactions):
         for reaction in pred_reactions:
             for bbox in reaction.bboxes:
-                if not bbox.is_mol:
-                    text = ocr.readtext(bbox.image(), detail=0)
-                    bbox.set_text(text)
-    return pred_reactions.to_json()
+                if bbox.is_mol != want_mol:
+                    continue
+                key = (k, bbox.pixel_box())
+                if key not in index:
+                    index[key] = len(crops)
+                    crops.append(bbox.image())
+                    groups.append([])
+                groups[index[key]].append(bbox)
+    return crops, groups
+
+
+def _run_ocr(all_reactions, ocr):
+    crops, groups = _unique_crops(all_reactions, want_mol=False)
+    for crop, bboxes in zip(crops, groups):
+        text = ocr.readtext(crop, detail=0)
+        for bbox in bboxes:
+            bbox.set_text(text)
+
+
+def postprocess_reactions_batch(image_datas, molscribe=None, ocr=None, batch_size=32):
+    """Postprocess the predictions of several images at once.
+
+    All molecule crops of all images go to MolScribe in a single `predict_images` call, so a shared or remote MolScribe
+    sees one large request instead of one small request per image, and a crop that appears in several reactions is
+    recognised once. Output equals `postprocess_reactions` per image when MolScribe is batch-invariant
+    (true for molscribe-custom).
+    :param image_datas: ReactionImageData objects built with `predictions=`.
+    """
+    all_reactions = []
+    for image_data in image_datas:
+        pred_reactions = image_data.pred_reactions
+        for r in pred_reactions:
+            r.deduplicate()
+        pred_reactions.deduplicate()
+        all_reactions.append(pred_reactions)
+
+    ocr_thread = None
+    if ocr and molscribe and getattr(molscribe, 'remote', False):
+        # MolScribe runs in another process: read the text boxes while waiting for it
+        import threading
+        ocr_thread = threading.Thread(target=_run_ocr, args=(all_reactions, ocr), daemon=True)
+        ocr_thread.start()
+
+    if molscribe:
+        crops, groups = _unique_crops(all_reactions, want_mol=True)
+        if len(crops) > 0:
+            predictions = molscribe.predict_images(crops, batch_size=batch_size)
+            for bboxes, pred in zip(groups, predictions):
+                for bbox in bboxes:
+                    bbox.set_smiles(pred['smiles'], pred['molfile'])
+
+    if ocr_thread is not None:
+        ocr_thread.join()
+    elif ocr:
+        _run_ocr(all_reactions, ocr)
+    return [pred_reactions.to_json() for pred_reactions in all_reactions]
