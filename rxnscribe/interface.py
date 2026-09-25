@@ -92,8 +92,11 @@ class RxnScribe:
         transformer = self.model.transformer
         transformer.fast_decoding = fast_decoding
         transformer.use_cuda_graph = cuda_graph and self.device.type == 'cuda'
-        self._mean = torch.tensor(MEAN, device=self.device).view(1, 3, 1, 1)
-        self._std = torch.tensor(STD, device=self.device).view(1, 3, 1, 1)
+        # uint8 -> normalised float as a lookup table computed on the CPU with the ops of ToTensor + Normalize, so the
+        # device result is bitwise identical (CUDA divides by a scalar through a reciprocal, which is not)
+        levels = torch.arange(256, dtype=torch.uint8).float().div(255)
+        lut = (levels.view(1, 256) - torch.tensor(MEAN).view(3, 1)) / torch.tensor(STD).view(3, 1)
+        self._lut = lut.to(self.device)
         if preprocess_threads is None:
             preprocess_threads = min(8, os.cpu_count() or 1)
         self._pool = ThreadPoolExecutor(preprocess_threads) if preprocess_threads > 0 else None
@@ -200,9 +203,12 @@ class RxnScribe:
         pixels = torch.from_numpy(np.stack([p[0] for p in prepared]))
         if self.device.type == 'cuda':
             pixels = pixels.pin_memory().to(self.device, non_blocking=True)
-        # same arithmetic as ToTensor + Normalize, on the device (uint8 crosses the bus, not float32)
-        x = pixels.permute(0, 3, 1, 2).float().div(255)
-        x = x.sub_(self._mean).div_(self._std)
+        # normalisation on the device (uint8 crosses the bus, not float32)
+        b, h, w, _ = pixels.shape
+        x = torch.empty((b, 3, h, w), dtype=torch.float32, device=self.device)
+        for c in range(3):
+            index = pixels[..., c].reshape(-1).int()
+            x[:, c] = torch.index_select(self._lut[c], 0, index).view(b, h, w)
         mask = torch.zeros((x.shape[0], x.shape[2], x.shape[3]), dtype=torch.bool, device=self.device)
         return NestedTensor(x, mask), [p[1] for p in prepared]
 
