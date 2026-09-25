@@ -91,7 +91,8 @@ with `category`, normalised `bbox`, and `smiles`/`molfile` (molecules) or `text`
 
 * **Throughput** (a folder of PDFs' figures): `precision="fp16"`, `batch_size=16…32`. Keep the batch size fixed:
   one CUDA graph is captured per distinct batch size (plus one for the last, smaller batch).
-* **Latency** (one image per request): `precision="fp32"` or `"tf32"`; fp16 helps little at batch 1.
+* **Latency** (one image per request): `precision="fp16"` (91 ms) is slightly faster than fp32 (102 ms); use fp32
+  when outputs must match upstream exactly. For MolScribe single images use `tf32` (fp16 is slower there).
 * Results can differ slightly between batch sizes (cuDNN picks different convolution algorithms), in upstream as well
   (8 of 300 images between batch 1 and 16).
 
