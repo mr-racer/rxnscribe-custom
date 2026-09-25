@@ -36,6 +36,42 @@ def _allow_tf32():
         torch.backends.cuda.matmul.allow_tf32, torch.backends.cudnn.allow_tf32 = previous
 
 
+@torch.no_grad()
+def fuse_frozen_bn(backbone):
+    """Fold every FrozenBatchNorm2d of the ResNet into the preceding convolution (conv has no bias).
+
+    Mathematically the same network, but rounding differs in the last bits, so it is used only with fp16/bf16, where
+    the unfused BN would also turn every activation back into fp32 (scale/bias are fp32) and double the memory traffic.
+    """
+    from torch import nn
+    from .pix2seq.backbone import FrozenBatchNorm2d
+
+    def fold(conv, bn):
+        scale = bn.weight * (bn.running_var + 1e-5).rsqrt()
+        conv.weight.mul_(scale.view(-1, 1, 1, 1))
+        conv.bias = nn.Parameter(bn.bias - bn.running_mean * scale)
+
+    body = backbone[0].body
+    pairs = [(body.conv1, body, 'bn1')]
+    for name, module in body.named_children():
+        if name.startswith('layer'):
+            for block in module:
+                for i in (1, 2, 3):
+                    if hasattr(block, f'bn{i}'):
+                        pairs.append((getattr(block, f'conv{i}'), block, f'bn{i}'))
+                if block.downsample is not None:
+                    pairs.append((block.downsample[0], block.downsample, '1'))
+    for conv, parent, bn_name in pairs:
+        bn = getattr(parent, bn_name) if not bn_name.isdigit() else parent[int(bn_name)]
+        assert isinstance(bn, FrozenBatchNorm2d)
+        fold(conv, bn)
+        if bn_name.isdigit():
+            parent[int(bn_name)] = nn.Identity()
+        else:
+            setattr(parent, bn_name, nn.Identity())
+    return len(pairs)
+
+
 def _prepare_image(image):
     """Resize (longer side -> 1333, PIL bilinear) and pad with white to 1333x1333, kept as uint8 HWC.
 
@@ -59,7 +95,7 @@ def _prepare_image(image):
 class RxnScribe:
 
     def __init__(self, model_path, device=None, molscribe=None, ocr=None, precision='fp32', fast_decoding=True,
-                 cuda_graph=True, preprocess_threads=None, molscribe_kwargs=None):
+                 cuda_graph=True, preprocess_threads=None, molscribe_kwargs=None, fuse_bn=None, channels_last=None):
         """
         RxnScribe Interface
         :param model_path: path of the model checkpoint.
@@ -77,6 +113,9 @@ class RxnScribe:
         :param cuda_graph: replay the decoding step as a CUDA graph (CUDA + fast_decoding).
         :param preprocess_threads: threads preparing the next batch while the current one runs; 0 disables.
         :param molscribe_kwargs: extra arguments for a MolScribe created here (e.g. {'precision': 'fp16'}).
+        :param fuse_bn: fold the backbone's frozen BatchNorms into its convolutions (default: on for fp16/bf16 on CUDA;
+            off for fp32/tf32, which stay bitwise identical to upstream).
+        :param channels_last: NHWC layout for the backbone (default: same rule as fuse_bn).
         """
         if precision not in PRECISIONS:
             raise ValueError(f"precision must be one of {list(PRECISIONS)}")
@@ -89,6 +128,12 @@ class RxnScribe:
         self.precision = precision
         self.tokenizer = get_tokenizer(args)
         self.model = self.get_model(args, self.tokenizer, self.device, states['state_dict'])
+        half = self.device.type == 'cuda' and PRECISIONS[precision] is not None
+        if fuse_bn if fuse_bn is not None else half:
+            fuse_frozen_bn(self.model.backbone)
+        self.channels_last = channels_last if channels_last is not None else half
+        if self.channels_last:
+            self.model.backbone.to(memory_format=torch.channels_last)
         transformer = self.model.transformer
         transformer.fast_decoding = fast_decoding
         transformer.use_cuda_graph = cuda_graph and self.device.type == 'cuda'
@@ -209,6 +254,8 @@ class RxnScribe:
         for c in range(3):
             index = pixels[..., c].reshape(-1).int()
             x[:, c] = torch.index_select(self._lut[c], 0, index).view(b, h, w)
+        if self.channels_last:
+            x = x.contiguous(memory_format=torch.channels_last)
         mask = torch.zeros((x.shape[0], x.shape[2], x.shape[3]), dtype=torch.bool, device=self.device)
         return NestedTensor(x, mask), [p[1] for p in prepared]
 
