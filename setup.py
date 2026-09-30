@@ -2,7 +2,7 @@ from setuptools import setup
 
 extras = {
     # local MolScribe in the same process (not needed when MolScribe is reached over HTTP/Celery)
-    'molscribe': ['MolScribe @ git+https://github.com/mr-racer/molscribe-custom.git@main'],
+    'molscribe': ['MolScribe @ git+https://gitlab.odanchem.org/odanchem/molscribe-custom.git@main'],
     'ocr': ['easyocr>=1.6.2'],
     'hub': ['huggingface-hub>=0.11.0'],          # only to download the default MolScribe checkpoint
     'draw': ['matplotlib>=3.5.3'],
@@ -18,7 +18,7 @@ setup(
     description='RxnScribe (custom fork: faster inference, shared/remote MolScribe)',
     author='Yujie Qian',
     author_email='yujieq@csail.mit.edu',
-    url='https://github.com/mr-racer/rxnscribe-custom',
+    url='https://gitlab.odanchem.org/odanchem/rxnscribe-custom',
     packages=['rxnscribe', 'rxnscribe.inference', 'rxnscribe.pix2seq', 'rxnscribe.transformer'],
     package_dir={'rxnscribe': 'rxnscribe'},
     install_requires=[

@@ -1,180 +1,250 @@
 # RxnScribe (custom fork)
 
-Reaction diagram parsing (image → reactions with reactant / condition / product boxes, SMILES, text), forked from
-[thomas0809/RxnScribe](https://github.com/thomas0809/RxnScribe) at `ad6b1c7`. Same model and checkpoint
-(`pix2seq_reaction_full.ckpt`), faster inference, a bug fix, and a way to reuse a MolScribe that is already running.
-Molecule recognition uses [molscribe-custom](https://github.com/mr-racer/molscribe-custom).
-The original README is kept in [README_upstream.md](README_upstream.md).
+Picture of a reaction scheme in → a list of reactions out: which boxes are reactants, which are conditions,
+which are products, plus the SMILES of every molecule and the text of every label.
 
-## What is different from upstream
+A fork of [thomas0809/RxnScribe](https://github.com/thomas0809/RxnScribe) with **the same model and the same
+public checkpoint**, 3–7× faster, one upstream bug fixed, and — the point of this fork — able to reuse a
+**MolScribe that is already running** instead of loading a second copy of it.
 
-| Area | Upstream | This fork |
-|---|---|---|
-| Decoding | Every step recomputes the key/value projections of the whole image memory (~1.8k positions) in all 6 decoder layers, grows the cache with `torch.cat`, runs the output grammar in Python per sample (host sync each step) | Memory K/V computed once per image, preallocated cache, grammar as two lookup tables on the device, host check every 8 steps, one step captured as a **CUDA graph**. Same tokens and scores |
-| Backbone in fp16/bf16 | — (fp32 only) | Frozen BatchNorms folded into the convolutions, `channels_last`: ResNet-50 25 → 10 ms/image |
-| Precision | fp32 | `fp32` (bitwise = upstream), `tf32`, `fp16`, `bf16` |
-| Preprocessing | PIL + float tensors on the CPU, single thread | same PIL resize in a thread pool while the GPU works; uint8 goes to the GPU and is normalised there (bitwise-identical input) |
-| **Bug** | `predict_images` cut molecule/text crops from `input_images[i]`, `i` being the index *inside the batch*: from the second batch on, every image got SMILES/text from crops of another image | fixed |
-| MolScribe | its own copy, downloaded from the HF hub at start | any object with `predict_images`: the MolScribe instance of the same process, a checkpoint path, or an HTTP / Celery client of a MolScribe in another container. All crops of a call go in **one** request; a molecule shared by several reactions is read once |
-| Start-up | downloads ImageNet ResNet-50 weights, the MolScribe checkpoint, EasyOCR models; imports matplotlib, pycocotools, huggingface_hub | nothing is downloaded (backbone weights are in the checkpoint); MolScribe/EasyOCR created on first use; EasyOCR model folder configurable |
-| Dependencies | torch, pandas, matplotlib, pycocotools, pytorch-lightning, transformers, huggingface-hub, MolScribe, easyocr, Pillow==9.5 | core: torch, torchvision, numpy, Pillow, opencv; the rest are extras (`[molscribe]`, `[ocr]`, `[draw]`, `[client]`, `[train]`) |
+This page is everything needed to put it into a service. The full comparison with upstream, the measurements
+and the internals are in [docs/fork-details.md](docs/fork-details.md); the original project's README is
+[README_upstream.md](README_upstream.md).
 
-## Speed (RTX A6000, full `predict_images`, ms per image)
+**RxnScribe does not read molecules itself.** It finds the boxes, crops them and hands the crops to MolScribe.
+So install [molscribe-custom](https://gitlab.odanchem.org/odanchem/molscribe-custom) first (or connect to the
+one already deployed — §3).
 
-Detection only (reactions and boxes):
+---
 
-| Mode | Upstream | Fork fp32 | Fork fp16 |
-|---|---|---|---|
-| Batched, `batch_size=16` (1 378 images) | 145 | 52 (×2.8) | **33 (×4.3)** |
-| Batched, `batch_size=32` | — | — | 31 |
-| One image per call (300 images) | 295 | 102 (×2.9) | 91 (×3.3) |
+## 1. Install
 
-Full pipeline (`molscribe=True, ocr=True`, MolScribe `swin_base_char_aux_1m.pth`, EasyOCR):
+Same Python/PyTorch requirements as MolScribe (tested on torch 2.x, CUDA 11.8+). GPU strongly recommended.
 
-| Mode | Upstream | Fork fp32 | Fork fp16 |
-|---|---|---|---|
-| Batched, `batch_size=16` | 761 | 160 (×4.8) | **115 (×6.6)** |
-| One image per call | 757 | 254 (×3.0) | 239 (×3.2) |
+```bash
+# RxnScribe next to a MolScribe running in another container (HTTP), with text OCR:
+pip install "rxnscribe[ocr,client] @ git+https://gitlab.odanchem.org/odanchem/rxnscribe-custom.git@main"
 
-In the full pipeline (fp32) most of the time is MolScribe (≈70 ms/image) and
-EasyOCR (≈35 ms/image). Where detection time goes (fp16, batch 16): backbone 10, encoder 8, decoder 11, preprocessing
-overlapped with the model.
+# RxnScribe and MolScribe in one process:
+pip install "rxnscribe[ocr,molscribe] @ git+https://gitlab.odanchem.org/odanchem/rxnscribe-custom.git@main"
+```
 
-**Accuracy** (reaction F1, upstream metric, all 1 378 test images; the checkpoint was trained on them, so only the
-comparison is meaningful):
+The core install is only `torch`, `torchvision`, `numpy`, `Pillow`, `opencv`. Extras: `[molscribe]` (a local
+MolScribe — pulls in rdkit and timm), `[ocr]` (EasyOCR), `[client]` (`requests`, for a remote MolScribe),
+`[draw]`, `[train]`.
 
-| | hard F1 | soft F1 | boxes identical to upstream |
-|---|---|---|---|
-| Upstream | 0.9196 | 0.9408 | — |
-| Fork fp32 | 0.9196 | 0.9408 | 1378 / 1378 |
-| Fork tf32 | 0.9196 | 0.9408 | 1346 / 1378 |
-| Fork fp16 | 0.9185 | 0.9389 | 922 / 1378 |
-| Fork bf16 | 0.9204 | 0.9410 | 155 / 1378 |
+The repositories are private — pip needs credentials in the URL
+(`git+https://oauth2:<token>@gitlab.odanchem.org/...`) or a deploy key.
 
-fp16/bf16 move some box corners by one coordinate bin; accuracy stays within ±0.2 points.
-Reproduce with `benchmark/` (`prepare_data.py`, `run_benchmark.py`, `evaluate.py`, `check_equivalence.py`,
-`profile_stages.py`).
+### Checkpoints
 
-## Usage
+Two or three files, put on a volume:
+
+```bash
+wget -P /models https://huggingface.co/yujieq/RxnScribe/resolve/main/pix2seq_reaction_full.ckpt  # ~400 MB
+# MolScribe, unless it is reached over HTTP/Celery:
+wget -P /models https://huggingface.co/yujieq/MolScribe/resolve/main/swin_base_char_aux_1m680k.pth
+```
+
+EasyOCR, if text boxes should be read: let it download itself once on any machine with network
+(`python -c "import easyocr; easyocr.Reader(['en'])"`), then copy `~/.EasyOCR/model/english_g2.pth` and
+`craft_mlt_25k.pth` (~100 MB) into `/models/easyocr/`. Given a folder, RxnScribe opens EasyOCR with
+`download_enabled=False`, so a missing file is an error rather than a silent download.
+
+Nothing is fetched at runtime once these paths are given, so the container works offline. The two model paths
+can also come from the environment: `RXNSCRIBE_MOLSCRIBE_CKPT`, `RXNSCRIBE_EASYOCR_DIR`.
+
+### Smoke test
+
+```bash
+RXNSCRIBE_MOLSCRIBE_CKPT=/models/swin_base_char_aux_1m680k.pth \
+RXNSCRIBE_EASYOCR_DIR=/models/easyocr \
+python predict.py --model_path /models/pix2seq_reaction_full.ckpt \
+                  --image_path assets/jacs.5b12989-Table-c3.png
+```
+
+(`predict.py` hard-codes `cuda` and asks for SMILES and text, hence the two environment variables; without them
+it would try to download MolScribe and EasyOCR.)
+
+---
+
+## 2. Use it
 
 ```python
 import torch
 from rxnscribe import RxnScribe
 
-model = RxnScribe("pix2seq_reaction_full.ckpt", device=torch.device("cuda"), precision="fp16",
-                  molscribe="swin_base_char_aux_1m680k.pth",   # or a MolScribe instance / remote client
-                  ocr="/models/easyocr")                       # folder with english_g2.pth, craft_mlt_25k.pth
+model = RxnScribe(
+    "/models/pix2seq_reaction_full.ckpt",
+    device=torch.device("cuda"),
+    precision="fp16",
+    molscribe="/models/swin_base_char_aux_1m680k.pth",  # path, live MolScribe object, or remote client — §3
+    ocr="/models/easyocr",                              # folder; omit to skip text recognition
+)
+
 reactions = model.predict_image_file("scheme.png", molscribe=True, ocr=True)
-batch = model.predict_images(list_of_pil_or_rgb_arrays, batch_size=16, molscribe=True, ocr=True)
+batch = model.predict_images(images, batch_size=16, molscribe=True, ocr=True)
 ```
 
-Output format is upstream's: per image a list of reactions, each with `reactants`, `conditions`, `products`, boxes
-with `category`, normalised `bbox`, and `smiles`/`molfile` (molecules) or `text` (text boxes).
+Output (upstream's format): per image a list of reactions; each reaction has `reactants`, `conditions`,
+`products`; each of those is a list of boxes with `category`, a normalised `bbox`, and either `smiles` +
+`molfile` (a molecule) or `text` (a label).
 
-### Constructor options
+`molscribe=False, ocr=False` gives detection only — boxes and their roles, no SMILES. That is 2.5–3.5× faster
+and needs no MolScribe at all; useful if only the layout is wanted.
 
-| Option | Default | Meaning |
-|---|---|---|
-| `device` | `cpu` | `torch.device("cuda")` for GPU |
-| `precision` | `fp32` | `tf32`, `fp16`, `bf16`. fp32 gives exactly upstream's output |
-| `molscribe` | `None` | MolScribe instance, remote client, or checkpoint path. `None`: env `RXNSCRIBE_MOLSCRIBE_CKPT`, else download from the HF hub |
-| `molscribe_kwargs` | `{}` | arguments for a MolScribe created from a path, e.g. `{"precision": "fp16"}` |
-| `ocr` | `None` | object with `readtext`, or EasyOCR model folder. `None`: env `RXNSCRIBE_EASYOCR_DIR`, else EasyOCR default (downloads) |
-| `fast_decoding` | `True` | `False` = upstream decoding loop (A/B checks only) |
-| `cuda_graph` | `True` | replay the decoding step as a CUDA graph |
-| `fuse_bn`, `channels_last` | auto | on for fp16/bf16 on CUDA, off otherwise |
-| `preprocess_threads` | `min(8, cpus)` | `0` disables the prefetch |
+Load the model **once** at start-up. Both models take a lock around their GPU work, so concurrent calls from a
+thread pool are safe — they queue.
 
-`predict_images(images, batch_size=16, molscribe=False, ocr=False, molscribe_batch_size=32)`.
+---
 
-## Choosing a mode
+## 3. Connecting to a MolScribe that already exists
 
-* **Throughput** (a folder of PDFs' figures): `precision="fp16"`, `batch_size=16…32`. Keep the batch size fixed:
-  one CUDA graph is captured per distinct batch size (plus one for the last, smaller batch).
-* **Latency** (one image per request): `precision="fp16"` (91 ms) is slightly faster than fp32 (102 ms); use fp32
-  when outputs must match upstream exactly. For MolScribe single images use `tf32` (fp16 is slower there).
-* Results can differ slightly between batch sizes (cuDNN picks different convolution algorithms), in upstream as well
-  (8 of 300 images between batch 1 and 16).
+RxnScribe only ever calls `molscribe.predict_images(crops, batch_size=...)`. Anything with that method works.
+All three layouts below leave an existing MolScribe deployment working exactly as before; pick by how the
+system is already split.
 
-## VRAM (peak allocated by PyTorch; add ≈0.4 GB of CUDA context)
+### A. One container, one GPU copy of MolScribe — fastest
+
+Crops never leave the process. In the MolScribe FastAPI app, after the model is built:
+
+```python
+from rxnscribe.serving import attach
+
+attach(app, molscribe=model, ckpt="/models/pix2seq_reaction_full.ckpt",
+       device=model.device, precision="fp16", ocr="/models/easyocr")   # POST /rxnscribe/predict_batch
+```
+
+MolScribe's own `/molscribe/predict_batch` keeps working. If `rxnscribe` is not installed, the import fails and
+the app stays a plain MolScribe — so this can be guarded and shipped in the same image:
+
+```python
+try:
+    from rxnscribe.serving import attach
+except ImportError:
+    attach = None
+if attach and os.environ.get("RXNSCRIBE_CKPT"):
+    attach(app, molscribe=model, ckpt=os.environ["RXNSCRIBE_CKPT"], device=model.device, precision="fp16")
+```
+
+### B. Separate containers, HTTP — when the models are already split
+
+MolScribe's container mounts its router (`molscribe.remote.make_router(model)`, see the MolScribe README);
+RxnScribe's container points a client at it:
+
+```python
+from rxnscribe.molscribe_client import HttpMolScribe
+
+model = RxnScribe(ckpt, device=torch.device("cuda"), precision="fp16",
+                  molscribe=HttpMolScribe("http://molscribe:8000/molscribe/predict_batch"))
+app.include_router(rxnscribe.serving.make_router(model))               # POST /rxnscribe/predict_batch
+```
+
+Crops travel as lossless PNG, so the results are identical to layout A (verified on 200 images); the cost is
+≈9 ms per image (138 vs 129 ms). All crops of one call go in **one** request, and a molecule shared by several
+reactions is recognised once. OCR runs while the MolScribe request is in flight. This container does not need
+MolScribe, rdkit or timm installed at all.
+
+### C. Celery
+
+`molscribe.remote.register_celery_task(celery_app, get_model)` in the MolScribe worker,
+`CeleryMolScribe(celery_app, queue="molscribe")` in RxnScribe. **Route the MolScribe task to its own
+queue and worker** — a single-slot worker that waits on its own sub-task deadlocks.
+
+---
+
+## 4. The two knobs that matter: `precision` and `batch_size`
+
+### Latency mode — one scheme per request
+
+```python
+model = RxnScribe(ckpt, device=torch.device("cuda"), precision="fp16", molscribe=..., ocr=...)
+model.predict_image_file("scheme.png", molscribe=True, ocr=True)      # ≈ 239 ms
+```
+
+Use `fp16` (91 ms detection vs 102 ms in fp32); use `fp32` only when the output must match upstream bit for bit.
+Note that a MolScribe used at batch 1 should itself run in `fp32`/`tf32`, not fp16 — see its README.
+
+### Throughput mode — a folder of figures
+
+```python
+model = RxnScribe(ckpt, device=torch.device("cuda"), precision="fp16", molscribe=..., ocr=...)
+model.predict_images(images, batch_size=16, molscribe=True, ocr=True)  # ≈ 115 ms/image
+```
+
+Use `fp16` and `batch_size=16…32`, and **keep the batch size fixed**: one CUDA graph is captured per distinct
+batch size (plus one for the final, smaller batch), so varying it wastes memory and capture time.
+
+| On an RTX A6000, ms per image | upstream | fork fp32 | fork fp16 |
+|---|---|---|---|
+| Detection only, batch 16 | 145 | 52 | **33** |
+| Detection only, one per call | 295 | 102 | **91** |
+| Full pipeline (+MolScribe +OCR), batch 16 | 761 | 160 | **115** |
+| Full pipeline, one per call | 757 | 254 | **239** |
+
+In the full pipeline most of the time is no longer RxnScribe: MolScribe ≈70 ms/image and EasyOCR ≈35 ms/image
+dominate. If throughput is the goal, tune those two first (MolScribe at `fp16`, large batch).
+
+fp16/bf16 shift some box corners by one coordinate bin; reaction F1 stays within ±0.2 points of fp32
+(0.9196 → 0.9185 hard F1).
+
+---
+
+## 5. VRAM
+
+Peak allocated by PyTorch; add ≈0.4 GB for the CUDA context.
 
 | | fp32 | fp16 |
 |---|---|---|
 | Detection, batch 1 | 0.7 GB | 0.35 GB |
 | Detection, batch 16 | 8.1 GB | 3.2 GB |
 | Detection, batch 32 | — | 6.2 GB |
-| + MolScribe + EasyOCR, batch 16 | 8.9 GB | 3.8 GB |
+| Full pipeline (+MolScribe +EasyOCR), batch 16 | 8.9 GB | 3.8 GB |
 
-Rule of thumb for detection: ≈0.5 GB per image in the batch (fp32), ≈0.2 GB (fp16). MolScribe's own budget is in
-its README. To cap memory: `torch.cuda.set_per_process_memory_fraction(...)` and halve `batch_size` on
-`OutOfMemoryError`.
+Rule of thumb for detection: **≈0.5 GB per image in the batch (fp32), ≈0.2 GB (fp16)**. With MolScribe in the
+same process, add its own budget (see its README).
 
-## Sharing MolScribe with RxnScribe
-
-RxnScribe needs molecule recognition only through `molscribe.predict_images(crops, batch_size=...)`. Three set-ups,
-from most to least efficient; in all of them a MolScribe deployment without RxnScribe works as before.
-
-**1. Same process** (one container, one GPU copy of MolScribe, crops never leave the process). In the MolScribe
-FastAPI app:
+To make a budget a hard limit rather than an estimate:
 
 ```python
-model = MolScribe(ckpt, device=torch.device("cuda"), precision="fp16")
-app.include_router(make_router(model))                    # molscribe.remote: POST /molscribe/predict_batch
-try:
-    from rxnscribe.serving import attach                  # rxnscribe not installed -> plain MolScribe
-except ImportError:
-    attach = None
-if attach and os.environ.get("RXNSCRIBE_CKPT"):
-    attach(app, molscribe=model, ckpt=os.environ["RXNSCRIBE_CKPT"], device=model.device,
-           precision="fp16", ocr=os.environ.get("RXNSCRIBE_EASYOCR_DIR"))   # POST /rxnscribe/predict_batch
+torch.cuda.set_per_process_memory_fraction(6 * 2**30 / torch.cuda.get_device_properties(0).total_memory)  # 6 GB
 ```
 
-Both models take a lock around their GPU work, so concurrent requests from FastAPI's thread pool are safe.
+Catch `torch.cuda.OutOfMemoryError` and halve `batch_size`.
 
-**2. Separate containers, HTTP** (the model/worker split): the MolScribe container mounts
-`molscribe.remote.make_router(model)`; the RxnScribe container uses a client:
+A practical starting point: **fp16, `batch_size=16`, ≈4 GB** covers the full pipeline with MolScribe and OCR in
+one process on a 8 GB card.
 
-```python
-from rxnscribe.molscribe_client import HttpMolScribe
-model = RxnScribe(ckpt, device=cuda, precision="fp16",
-                  molscribe=HttpMolScribe("http://molscribe:8000/molscribe/predict_batch"))
-app.include_router(rxnscribe.serving.make_router(model))
-```
+---
 
-Images travel as lossless PNG, so results are identical to set-up 1 (checked on 200 images); the cost was
-≈9 ms/image (138 vs 129 ms). OCR runs while the MolScribe request is in flight. The RxnScribe container then does not
-need MolScribe, timm or RDKit installed.
+## 6. When something goes wrong
 
-**3. Celery**: register `molscribe.remote.register_celery_task(celery_app, get_model)` in the MolScribe worker and
-use `CeleryMolScribe(celery_app, queue="molscribe")` in RxnScribe. Route the MolScribe task to its own queue/worker,
-otherwise a single-slot worker waiting for its own sub-task deadlocks.
+| Symptom | Cause / fix |
+|---|---|
+| `torch.cuda.OutOfMemoryError` | halve `batch_size` (it is the detection batch that dominates — see §5) |
+| Everything works but no SMILES appear | called with `molscribe=False`, or no `molscribe=` was passed to the constructor |
+| No `text` on condition boxes | `ocr=` not configured, or `ocr=False` at call time |
+| Start-up tries to download from Hugging Face | `molscribe=` / `ocr=` left at `None` — pass explicit paths (or set `RXNSCRIBE_MOLSCRIBE_CKPT`, `RXNSCRIBE_EASYOCR_DIR`) |
+| Celery worker hangs forever | layout C with MolScribe on the same queue — give it its own worker |
+| First call much slower than the rest | CUDA graph capture; warm up with one dummy image at start-up |
+| Results differ slightly between batch sizes | cuDNN picks different convolution algorithms per shape; upstream does this too. Keep the batch size fixed |
 
-## Docker notes
+---
 
-No symlink tricks for caches are needed any more:
+## 7. Docker
 
 ```dockerfile
 FROM pytorch/pytorch:2.7.1-cuda11.8-cudnn9-runtime
-RUN pip install "rxnscribe[ocr,client] @ git+https://github.com/mr-racer/rxnscribe-custom.git@main" fastapi uvicorn
-# add [molscribe] for set-up 1 (same process)
+RUN pip install "rxnscribe[ocr,client] @ git+https://oauth2:$TOKEN@gitlab.odanchem.org/odanchem/rxnscribe-custom.git@main" \
+                fastapi uvicorn
+# add [molscribe] instead of [client] for layout A (one process)
 COPY weights/pix2seq_reaction_full.ckpt /models/
-COPY weights/easyocr/ /models/easyocr/           # english_g2.pth, craft_mlt_25k.pth
-ENV RXNSCRIBE_CKPT=/models/pix2seq_reaction_full.ckpt RXNSCRIBE_EASYOCR_DIR=/models/easyocr
-# set-up 1 only: ENV RXNSCRIBE_MOLSCRIBE_CKPT=/models/swin_base_char_aux_1m680k.pth (if MolScribe is not passed in)
+COPY weights/easyocr/ /models/easyocr/          # english_g2.pth, craft_mlt_25k.pth
+ENV RXNSCRIBE_CKPT=/models/pix2seq_reaction_full.ckpt \
+    RXNSCRIBE_EASYOCR_DIR=/models/easyocr
 ```
 
-The ResNet-50 ImageNet file and the HF-hub cache of the upstream image are no longer used. The repositories are
-private: pip needs a token in the URL (`git+https://<token>@github.com/...`) or a copied checkout.
+`RXNSCRIBE_EASYOCR_DIR` (and `RXNSCRIBE_MOLSCRIBE_CKPT`) are read by the library; `RXNSCRIBE_CKPT` is only a
+convention for the app that calls `attach()` in layout A.
 
-## Files
-
-```
-rxnscribe/interface.py             RxnScribe: precision, preprocessing threads, lazy MolScribe/OCR
-rxnscribe/pix2seq/static_decoder.py  static decoder, grammar tables, CUDA graph
-rxnscribe/molscribe_client.py      HttpMolScribe, CeleryMolScribe, PNG/base64 wire format
-rxnscribe/serving.py               FastAPI router, Celery task, attach() next to MolScribe
-rxnscribe/data.py                  postprocessing (one MolScribe request per call, shared crops read once)
-benchmark/                         data preparation, timing, accuracy, equivalence, profiler
-```
-
-Training code and scripts are unchanged from upstream.
+Nothing is fetched at runtime, so no cache symlink tricks and no network are needed in the container.
